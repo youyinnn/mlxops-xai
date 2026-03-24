@@ -9,10 +9,12 @@ import torch.nn.functional as F
 from torchvision.transforms import v2
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn import metrics
+from tqdm import tqdm
+from torchmetrics import Metric
 from mlxops_utils import plot_hor, clp
 
 
-class AUC:
+class AUC(Metric):
     """
     Deletion/Insertion AUC evaluator for XAI saliency maps.
 
@@ -24,18 +26,26 @@ class AUC:
     A good saliency map should cause a sharp confidence drop under deletion (low DAUC)
     and a rapid confidence rise under insertion (high IAUC).
 
+    Follows the torchmetrics Metric API: call update() per batch, compute() at epoch end.
+    State is automatically reset after compute(), or manually via reset().
+
     Usage:
         auc = AUC(percentages=[1, 0.8, 0.6, 0.4, 0.2])
-        d_prob, i_prob = auc.get_input(model, batch, saliency_maps)
-        result = auc.score(d_prob, i_prob)
-        print(result['Overall_AUC'])
+        for batch, saliency_maps in dataloader:
+            auc.update(model, batch, saliency_maps)
+        result = auc.compute()
+        print(result['DAUC'], result['IAUC'])
 
     Args:
         percentages: Pixel-retention thresholds for deletion/insertion steps (default [1, 0.8, 0.6, 0.4, 0.2]).
         sigma: Gaussian blur kernel sigma used for insertion background (default 16).
         batch_size: Batch size for model inference (default 128).
         debug: If True, visualize deletion/insertion images and print probabilities.
+        kwargs: Passed to torchmetrics.Metric (e.g. compute_on_cpu, dist_sync_on_step).
     """
+
+    d_probs: list
+    i_probs: list
 
     def __init__(
         self,
@@ -43,13 +53,63 @@ class AUC:
         sigma: int = 16,
         batch_size: int = 128,
         debug: bool = False,
+        **kwargs,
     ) -> None:
+        super().__init__(**kwargs)
         self.percentages = percentages or [1, 0.8, 0.6, 0.4, 0.2]
         self.sigma = sigma
         self.batch_size = batch_size
         self.debug = debug
         self._delete_percentage = self.percentages
         self._insert_percentage = np.flip(self.percentages)
+
+        self.add_state('d_probs', default=[], dist_reduce_fx='cat')
+        self.add_state('i_probs', default=[], dist_reduce_fx='cat')
+
+    def update(
+        self,
+        model: nn.Module,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        saliency_maps: torch.Tensor,
+    ) -> None:
+        """
+        Process a batch and accumulate deletion/insertion probabilities.
+
+        Args:
+            model: Trained classification model.
+            batch: Tuple of (images, targets) — normalized input tensor (N, C, H, W) and class indices (N,).
+            saliency_maps: Saliency maps (N, H, W), values in [0, 1].
+        """
+        d_prob, i_prob = self.get_input(model, batch, saliency_maps)
+        self.d_probs.append(d_prob)
+        self.i_probs.append(i_prob)
+
+    def compute(self) -> dict:
+        """
+        Aggregate all accumulated batches and compute AUC scores over the full dataset.
+
+        Returns:
+            Dict with DAUC, IAUC, AUC_Percentage, DAUC_arr, IAUC_arr.
+        """
+        d_pred_prob = torch.cat(self.d_probs, dim=0)
+        i_pred_prob = torch.cat(self.i_probs, dim=0)
+        return self.score(d_pred_prob, i_pred_prob)
+
+    def evaluate(
+        self,
+        model: nn.Module,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        saliency_maps: torch.Tensor,
+    ) -> dict:
+        """
+        Compute AUC scores for a single batch of images in one shot.
+
+        For multi-batch evaluation over a full dataset, use update() + compute() instead.
+        """
+        self.update(model, batch, saliency_maps)
+        result = self.compute()
+        self.reset()
+        return result
 
     def get_input(
         self,
@@ -103,11 +163,11 @@ class AUC:
         Compute DAUC, IAUC, and Overall AUC from model confidence arrays.
 
         Args:
-            d_pred_prob: Output of get_input() deletion probabilities (N, num_steps).
-            i_pred_prob: Output of get_input() insertion probabilities (N, num_steps).
+            d_pred_prob: Deletion probabilities (N, num_steps).
+            i_pred_prob: Insertion probabilities (N, num_steps).
 
         Returns:
-            Dict with DAUC, IAUC, Overall_AUC, AUC_Percentage, DAUC_arr, IAUC_arr.
+            Dict with DAUC, IAUC, AUC_Percentage, DAUC_arr, IAUC_arr.
         """
         dauc = metrics.auc(np.flip(self._delete_percentage), d_pred_prob.mean(0))
         iauc = metrics.auc(self._insert_percentage, i_pred_prob.mean(0))
@@ -119,16 +179,6 @@ class AUC:
             'IAUC_arr': i_pred_prob,
         }
 
-    def evaluate(
-        self,
-        model: nn.Module,
-        batch: tuple[torch.Tensor, torch.Tensor],
-        saliency_maps: torch.Tensor,
-    ) -> dict:
-        """Convenience method: get_input + score in one call."""
-        d_prob, i_prob = self.get_input(model, batch, saliency_maps)
-        return self.score(d_prob, i_prob)
-
     def _build_variants(
         self,
         original_images: torch.Tensor,
@@ -138,7 +188,7 @@ class AUC:
         all_inserted = []
         blurrer = v2.GaussianBlur(kernel_size=self.sigma * 2 + 1, sigma=self.sigma)
 
-        for i in range(len(original_images)):
+        for i in tqdm(range(len(original_images)), desc='AUC: building variants'):
             image = original_images[i]
             saliency_map = saliency_maps[i]
 
@@ -168,7 +218,7 @@ class AUC:
         num_aug: int,
     ) -> torch.Tensor:
         prediction = []
-        for d in dataloader:
+        for d in tqdm(dataloader, desc='AUC: model inference'):
             prediction.extend(model(d[0].to(device)))
 
         prediction = torch.stack(prediction).to(device)

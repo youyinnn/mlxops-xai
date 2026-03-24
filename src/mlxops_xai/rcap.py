@@ -6,10 +6,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
+from torchmetrics import Metric
 from mlxops_utils import data_utils, plotting_utils
 
 
-class RCAP:
+class RCAP(Metric):
     """
     RCAP (Recovered image Confidence during Progressive image recovery) evaluator.
 
@@ -18,35 +20,152 @@ class RCAP:
     at each stage. A good saliency map should restore model confidence quickly
     using only a small fraction of the image.
 
+    Follows the torchmetrics Metric API: call update() per batch, compute() at epoch end.
+    State is automatically reset after compute(), or manually via reset().
+
     Usage:
         rcap = RCAP(lower_bound=0.5, recover_interval=0.1)
-        result = rcap.evaluate(model, batch, saliency_func, saliency_func_kwargs)
+        for batch, saliency_maps in dataloader:
+            rcap.update(model, batch, saliency_maps)
+        result = rcap.compute()
         print(result['overall_rcap']['RCAP'])
 
     Args:
         lower_bound: Lowest saliency quantile to start recovery from (default 0.7).
         recover_interval: Quantile step between recovery stages (default 0.3).
         debug: If True, visualize recovered images at each stage.
+        kwargs: Passed to torchmetrics.Metric (e.g. compute_on_cpu, dist_sync_on_step).
     """
+
+    # Accumulated per-sample arrays — stored as list states so torchmetrics
+    # can cat them across distributed workers and reset them automatically.
+    original_pred_score: list
+    recovered_pred_score: list
+    original_pred_prob: list
+    recovered_pred_prob: list
+    local_heat_mean: list
+    local_heat_sum: list
+    overall_heat_mean: list
+    overall_heat_sum: list
+    all_original_pred_prob_full: list
+    all_recovered_pred_prob_full: list
 
     def __init__(
         self,
         lower_bound: float = 0.7,
         recover_interval: float = 0.3,
         debug: bool = False,
+        **kwargs,
     ) -> None:
+        super().__init__(**kwargs)
         self.lower_bound = lower_bound
         self.recover_interval = recover_interval
         self.debug = debug
+
+        for name in (
+            'original_pred_score', 'recovered_pred_score',
+            'original_pred_prob', 'recovered_pred_prob',
+            'local_heat_mean', 'local_heat_sum',
+            'overall_heat_mean', 'overall_heat_sum',
+            'all_original_pred_prob_full', 'all_recovered_pred_prob_full',
+        ):
+            self.add_state(name, default=[], dist_reduce_fx='cat')
+
+    def update(
+        self,
+        model: nn.Module,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        saliency_maps: torch.Tensor,
+    ) -> None:
+        """
+        Process a batch and accumulate recovery statistics.
+
+        Args:
+            model: Trained classification model.
+            batch: Tuple of (images, targets) — normalized input tensor and class indices.
+            saliency_maps: Pre-computed saliency maps (N, H, W), values in [0, 1].
+        """
+        model = model.eval()
+        images, targets = batch
+        saliency_maps = saliency_maps.to(images.device)
+
+        (
+            original_pred_score, recovered_pred_score,
+            original_pred_prob, recovered_pred_prob,
+            local_heat_mean, local_heat_sum,
+            overall_heat_mean, overall_heat_sum,
+            original_pred_prob_full, recovered_pred_prob_full,
+            _recovered_imgs,
+        ) = self._compute_recovery_scores(model, images, targets, saliency_maps)
+
+        # torchmetrics list states accept tensors; convert numpy → tensor here
+        def _t(arr: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(arr)
+
+        self.original_pred_score.append(_t(original_pred_score))
+        self.recovered_pred_score.append(_t(recovered_pred_score))
+        self.original_pred_prob.append(_t(original_pred_prob))
+        self.recovered_pred_prob.append(_t(recovered_pred_prob))
+        self.local_heat_mean.append(_t(local_heat_mean))
+        self.local_heat_sum.append(_t(local_heat_sum))
+        self.overall_heat_mean.append(_t(overall_heat_mean))
+        self.overall_heat_sum.append(_t(overall_heat_sum))
+        self.all_original_pred_prob_full.append(_t(original_pred_prob_full))
+        self.all_recovered_pred_prob_full.append(_t(recovered_pred_prob_full))
+
+    def compute(self) -> dict[str, np.ndarray | dict]:
+        """
+        Aggregate all accumulated batches and compute RCAP scores over the full dataset.
+
+        Returns:
+            Dict with prediction scores, saliency statistics, and overall RCAP scores.
+        """
+        def _np(tensors: list[torch.Tensor]) -> np.ndarray:
+            return torch.cat(tensors, dim=0).cpu().numpy()
+
+        original_pred_score   = _np(self.original_pred_score)
+        recovered_pred_score  = _np(self.recovered_pred_score)
+        original_pred_prob    = _np(self.original_pred_prob)
+        recovered_pred_prob   = _np(self.recovered_pred_prob)
+        local_heat_mean       = _np(self.local_heat_mean)
+        local_heat_sum        = _np(self.local_heat_sum)
+        overall_heat_mean     = _np(self.overall_heat_mean)
+        overall_heat_sum      = _np(self.overall_heat_sum)
+        original_pred_prob_full  = _np(self.all_original_pred_prob_full)
+        recovered_pred_prob_full = _np(self.all_recovered_pred_prob_full)
+
+        score_inputs = (
+            original_pred_score, recovered_pred_score,
+            original_pred_prob, recovered_pred_prob,
+            local_heat_mean, local_heat_sum,
+            overall_heat_mean, overall_heat_sum,
+            None,
+        )
+
+        return {
+            'original_pred_score':          original_pred_score,
+            'recovered_pred_score':         recovered_pred_score,
+            'original_pred_prob':           original_pred_prob,
+            'recovered_pred_prob':          recovered_pred_prob,
+            'local_heat_mean':              local_heat_mean,
+            'local_heat_sum':               local_heat_sum,
+            'overall_heat_mean':            overall_heat_mean,
+            'overall_heat_sum':             overall_heat_sum,
+            'all_original_pred_prob_full':  original_pred_prob_full,
+            'all_recovered_pred_prob_full': recovered_pred_prob_full,
+            'overall_rcap':                 self._compute_rcap_score(score_inputs),
+        }
 
     def evaluate(
         self,
         model: nn.Module,
         batch: tuple[torch.Tensor, torch.Tensor],
         saliency_maps: torch.Tensor,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, np.ndarray | dict]:
         """
-        Compute RCAP scores for a batch of images.
+        Compute RCAP scores for a single batch of images in one shot.
+
+        For multi-batch evaluation over a full dataset, use update() + compute() instead.
 
         Args:
             model: Trained classification model.
@@ -56,42 +175,10 @@ class RCAP:
         Returns:
             Dict with prediction scores, saliency statistics, and overall RCAP scores.
         """
-        model = model.eval()
-        images, targets = batch
-
-        saliency_maps = saliency_maps.to(images.device)
-
-        recovery_outputs = self._compute_recovery_scores(
-            model, images, targets, saliency_maps)
-
-        original_pred_score, recovered_pred_score, \
-            original_pred_prob, recovered_pred_prob, \
-            local_heat_mean, local_heat_sum, \
-            overall_heat_mean, overall_heat_sum, \
-            original_pred_prob_full, recovered_pred_prob_full, \
-            recovered_imgs = recovery_outputs
-
-        score_inputs = (
-            np.array(original_pred_score), np.array(recovered_pred_score),
-            np.array(original_pred_prob), np.array(recovered_pred_prob),
-            np.array(local_heat_mean), np.array(local_heat_sum),
-            np.array(overall_heat_mean), np.array(overall_heat_sum),
-            None,
-        )
-
-        return {
-            'original_pred_score':       score_inputs[0],
-            'recovered_pred_score':      score_inputs[1],
-            'original_pred_prob':        score_inputs[2],
-            'recovered_pred_prob':       score_inputs[3],
-            'local_heat_mean':           score_inputs[4],
-            'local_heat_sum':            score_inputs[5],
-            'overall_heat_mean':         score_inputs[6],
-            'overall_heat_sum':          score_inputs[7],
-            'all_original_pred_prob_full':  np.array(original_pred_prob_full),
-            'all_recovered_pred_prob_full': np.array(recovered_pred_prob_full),
-            'overall_rcap':              self._compute_rcap_score(score_inputs),
-        }
+        self.update(model, batch, saliency_maps)
+        result = self.compute()
+        self.reset()
+        return result
 
     @staticmethod
     def compute_score(recovered_pred: tuple, debug: bool = False) -> dict[str, np.ndarray]:
@@ -247,7 +334,7 @@ class RCAP:
         local_heat_sum: list[list[float]] = []
         recovered_imgs: list[np.ndarray] = []
 
-        for i in range(n):
+        for i in tqdm(range(n), desc='RCAP: building recovered images'):
             img = original_images[i]
             saliency_map = saliency_maps[i]
             recovered_stack, stage_heat_mean, stage_heat_sum = self._build_recovered_image(

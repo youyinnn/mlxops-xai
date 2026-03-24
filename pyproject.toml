@@ -11,6 +11,7 @@ requires-python = ">=3.11.4"
 dependencies = [
     "torch",
     "torchvision",
+    "torchmetrics",
     "numpy",
     "tqdm",
     "mlxops-utils",
