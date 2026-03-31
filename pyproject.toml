@@ -28,3 +28,6 @@ Homepage = "https://github.com/youyinnn/mlxops-xai"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mlxops_xai"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["examples"]
