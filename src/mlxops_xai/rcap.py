@@ -2,16 +2,15 @@
 # (allows `list[float] | None` syntax without importing from typing)
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from torchmetrics import Metric
 from mlxops_utils import data_utils, plotting_utils
+from mlxops_xai.progress import XAIProgress, XAIMetric
 
 
-class RCAP(Metric):
+class RCAP(XAIMetric):
     """
     RCAP (Recovered image Confidence during Progressive image recovery) evaluator.
 
@@ -34,6 +33,8 @@ class RCAP(Metric):
         lower_bound: Lowest saliency quantile to start recovery from (default 0.7).
         recover_interval: Quantile step between recovery stages (default 0.3).
         debug: If True, visualize recovered images at each stage.
+        tqdm_verbose: If True, show internal tqdm progress bars.
+        on_progress: Optional callable(XAIProgress) invoked on each sample processed.
         kwargs: Passed to torchmetrics.Metric (e.g. compute_on_cpu, dist_sync_on_step).
     """
 
@@ -55,12 +56,13 @@ class RCAP(Metric):
         lower_bound: float = 0.7,
         recover_interval: float = 0.3,
         debug: bool = False,
+        tqdm_verbose: bool = False,
+        on_progress: callable = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(debug=debug, tqdm_verbose=tqdm_verbose, on_progress=on_progress, **kwargs)
         self.lower_bound = lower_bound
         self.recover_interval = recover_interval
-        self.debug = debug
 
         for name in (
             'original_pred_score', 'recovered_pred_score',
@@ -98,41 +100,37 @@ class RCAP(Metric):
             _recovered_imgs,
         ) = self._compute_recovery_scores(model, images, targets, saliency_maps)
 
-        # torchmetrics list states accept tensors; convert numpy → tensor here
-        def _t(arr: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(arr)
+        self.original_pred_score.append(original_pred_score)
+        self.recovered_pred_score.append(recovered_pred_score)
+        self.original_pred_prob.append(original_pred_prob)
+        self.recovered_pred_prob.append(recovered_pred_prob)
+        self.local_heat_mean.append(local_heat_mean)
+        self.local_heat_sum.append(local_heat_sum)
+        self.overall_heat_mean.append(overall_heat_mean)
+        self.overall_heat_sum.append(overall_heat_sum)
+        self.all_original_pred_prob_full.append(original_pred_prob_full)
+        self.all_recovered_pred_prob_full.append(recovered_pred_prob_full)
 
-        self.original_pred_score.append(_t(original_pred_score))
-        self.recovered_pred_score.append(_t(recovered_pred_score))
-        self.original_pred_prob.append(_t(original_pred_prob))
-        self.recovered_pred_prob.append(_t(recovered_pred_prob))
-        self.local_heat_mean.append(_t(local_heat_mean))
-        self.local_heat_sum.append(_t(local_heat_sum))
-        self.overall_heat_mean.append(_t(overall_heat_mean))
-        self.overall_heat_sum.append(_t(overall_heat_sum))
-        self.all_original_pred_prob_full.append(_t(original_pred_prob_full))
-        self.all_recovered_pred_prob_full.append(_t(recovered_pred_prob_full))
-
-    def compute(self) -> dict[str, np.ndarray | dict]:
+    def compute(self) -> dict[str, torch.Tensor | dict]:
         """
         Aggregate all accumulated batches and compute RCAP scores over the full dataset.
 
         Returns:
             Dict with prediction scores, saliency statistics, and overall RCAP scores.
         """
-        def _np(tensors: list[torch.Tensor]) -> np.ndarray:
-            return torch.cat(tensors, dim=0).cpu().numpy()
+        def _cat(tensors: list[torch.Tensor]) -> torch.Tensor:
+            return torch.cat(tensors, dim=0).cpu()
 
-        original_pred_score   = _np(self.original_pred_score)
-        recovered_pred_score  = _np(self.recovered_pred_score)
-        original_pred_prob    = _np(self.original_pred_prob)
-        recovered_pred_prob   = _np(self.recovered_pred_prob)
-        local_heat_mean       = _np(self.local_heat_mean)
-        local_heat_sum        = _np(self.local_heat_sum)
-        overall_heat_mean     = _np(self.overall_heat_mean)
-        overall_heat_sum      = _np(self.overall_heat_sum)
-        original_pred_prob_full  = _np(self.all_original_pred_prob_full)
-        recovered_pred_prob_full = _np(self.all_recovered_pred_prob_full)
+        original_pred_score   = _cat(self.original_pred_score)
+        recovered_pred_score  = _cat(self.recovered_pred_score)
+        original_pred_prob    = _cat(self.original_pred_prob)
+        recovered_pred_prob   = _cat(self.recovered_pred_prob)
+        local_heat_mean       = _cat(self.local_heat_mean)
+        local_heat_sum        = _cat(self.local_heat_sum)
+        overall_heat_mean     = _cat(self.overall_heat_mean)
+        overall_heat_sum      = _cat(self.overall_heat_sum)
+        original_pred_prob_full  = _cat(self.all_original_pred_prob_full)
+        recovered_pred_prob_full = _cat(self.all_recovered_pred_prob_full)
 
         score_inputs = (
             original_pred_score, recovered_pred_score,
@@ -161,7 +159,7 @@ class RCAP(Metric):
         model: nn.Module,
         batch: tuple[torch.Tensor, torch.Tensor],
         saliency_maps: torch.Tensor,
-    ) -> dict[str, np.ndarray | dict]:
+    ) -> dict[str, torch.Tensor | dict]:
         """
         Compute RCAP scores for a single batch of images in one shot.
 
@@ -181,7 +179,7 @@ class RCAP(Metric):
         return result
 
     @staticmethod
-    def compute_score(recovered_pred: tuple, debug: bool = False) -> dict[str, np.ndarray]:
+    def compute_score(recovered_pred: tuple, debug: bool = False) -> dict[str, torch.Tensor]:
         """
         Compute the final RCAP metric from pre-computed recovery statistics.
 
@@ -208,19 +206,18 @@ class RCAP(Metric):
 
         # visual_noise_level[i, k] = local_heat_sum[i, k] / overall_heat_sum[i]
         # overall_heat_sum[:, None] broadcasts (n,) → (n, 1) so each row divides by its own total
-        visual_noise_level: np.ndarray = local_heat_sum / \
-            overall_heat_sum[:, None]
+        visual_noise_level: torch.Tensor = local_heat_sum / overall_heat_sum[:, None]
 
-        rcap_with_heat_weight: np.ndarray = \
+        rcap_with_heat_weight: torch.Tensor = \
             (local_heat_mean * visual_noise_level * recovered_pred_prob).mean(-1)
-        rcap_score: np.ndarray = \
+        rcap_score: torch.Tensor = \
             (visual_noise_level * recovered_pred_prob).mean(-1)
 
         if debug:
             print('\r\n3-- visual_noise_level = local_heat_sum / overall_heat_sum')
             print(visual_noise_level)
             print('\r\n4-- recovered pred prob')
-            print(recovered_pred_prob, np.mean(recovered_pred_prob, axis=1))
+            print(recovered_pred_prob, recovered_pred_prob.mean(dim=1))
             print('\r\n6-- RCAP variants')
             print('local_heat_mean * visual_noise_level * recovered_pred_prob',
                   rcap_with_heat_weight)
@@ -232,7 +229,7 @@ class RCAP(Metric):
             'RCAP':               rcap_score,
         }
 
-    def _compute_rcap_score(self, recovered_pred: tuple) -> dict[str, np.ndarray]:
+    def _compute_rcap_score(self, recovered_pred: tuple) -> dict[str, torch.Tensor]:
         return self.compute_score(recovered_pred, debug=self.debug)
 
     def _build_recovered_image(
@@ -255,51 +252,40 @@ class RCAP(Metric):
             recovered_stack: Stacked recovered images (N_stages, C, H, W).
             local_heat_mean: Cumulative mean saliency of revealed region at each stage.
             local_heat_sum:  Cumulative sum saliency of revealed region at each stage.
-
-        Note on local_heat vs current_bin_mask:
-            - current_bin_mask uses <= saliency_upper_bound to select only the *current*
-              bin's pixels for incremental image reveal (avoids re-filling already-revealed pixels).
-            - local_heat uses all pixels > saliency_lower_bound to accumulate saliency over
-              *all revealed bins so far*, matching the cumulative nature of the recovered image.
         """
-        recovered_stack: list[torch.Tensor] = []
         sorted_saliency, _ = torch.sort(saliency_map.flatten())
+        num_pixels = sorted_saliency.shape[0]
 
-        # Compute quantile boundary indices and look up saliency thresholds in one shot
-        # (avoids Python loop + .item() calls for each quantile)
-        quantiles = [round(r, 2) for r in np.arange(
-            self.lower_bound, 0.999999, self.recover_interval)]
-        quantile_idx = torch.tensor(
-            [int(sorted_saliency.shape[0] * q) - 1 for q in quantiles],
-            dtype=torch.long,
+        # Compute quantile boundary indices and look up saliency thresholds — pure tensor ops
+        quantile_vals = torch.arange(
+            self.lower_bound, 0.999999, self.recover_interval,
+            device=saliency_map.device,
         )
+        quantile_idx = torch.clamp((quantile_vals * num_pixels).long() - 1, min=0)
         # flip to high→low order so we reveal most-salient regions first
-        quantile_thresholds = sorted_saliency[quantile_idx].flip(0)
+        quantile_thresholds = sorted_saliency[quantile_idx].flip(0)  # (n_stages,)
 
-        local_heat_mean: list[float] = []
-        local_heat_sum: list[float] = []
-        saliency_upper_bound: float = 1.0
-        canvas = torch.zeros_like(img)  # start from a blank canvas
+        # Vectorized: build all cumulative masks at once — (n_stages, H, W)
+        # stage k reveals all pixels with saliency > thresholds[k]
+        thresholds_clamped = torch.where(
+            quantile_thresholds < 1.0, quantile_thresholds, torch.zeros_like(quantile_thresholds))
+        cumulative_masks = saliency_map.unsqueeze(0) > thresholds_clamped.view(-1, 1, 1)
 
-        for threshold in quantile_thresholds:
-            t = threshold.item()
-            saliency_lower_bound = t if t < 1 else 0.0
+        # Build all recovered images in one broadcast where — (n_stages, C, H, W)
+        recovered_stack = torch.where(
+            cumulative_masks.unsqueeze(1),
+            img.unsqueeze(0).expand(len(quantile_thresholds), -1, -1, -1),
+            torch.zeros_like(img).unsqueeze(0),
+        )
 
-            # Mask for the current bin only — used to incrementally reveal pixels
-            current_bin_mask = (saliency_map > saliency_lower_bound) & (
-                saliency_map <= saliency_upper_bound)
+        # Cumulative saliency stats: sum/mean over revealed pixels per stage
+        cumulative_masks_f = cumulative_masks.float()
+        masked_sal = saliency_map.unsqueeze(0) * cumulative_masks_f          # (n_stages, H, W)
+        n_revealed = cumulative_masks_f.sum(dim=(1, 2))                       # (n_stages,)
+        local_heat_sum_t = masked_sal.sum(dim=(1, 2))                         # (n_stages,)
+        local_heat_mean_t = local_heat_sum_t / n_revealed.clamp(min=1)
 
-            # Cumulative saliency stats over all revealed regions (> saliency_lower_bound)
-            # saliency_map is already in [0,1] so <= 1 is always true — skip that condition
-            revealed = saliency_map[saliency_map > saliency_lower_bound]
-            local_heat_mean.append(revealed.mean().item())
-            local_heat_sum.append(revealed.sum().item())
-
-            canvas = torch.where(current_bin_mask, img, canvas)
-            recovered_stack.append(canvas.reshape(1, *canvas.shape))
-            saliency_upper_bound = saliency_lower_bound
-
-        return torch.vstack(recovered_stack), local_heat_mean, local_heat_sum
+        return recovered_stack, local_heat_mean_t, local_heat_sum_t
 
     def _compute_recovery_scores(
         self,
@@ -322,41 +308,52 @@ class RCAP(Metric):
         """
         device = original_images.device
         n = original_images.shape[0]
-        all_inputs_batch: list[torch.Tensor] = []
-        n_bins: int | None = None
 
         if targets is None:
             with torch.no_grad():
                 targets = torch.argmax(model(original_images), dim=1)
 
         original_images = data_utils.denormalize(original_images)
-        local_heat_mean: list[list[float]] = []
-        local_heat_sum: list[list[float]] = []
-        recovered_imgs: list[np.ndarray] = []
 
-        for i in tqdm(range(n), desc='RCAP: building recovered images'):
-            img = original_images[i]
-            saliency_map = saliency_maps[i]
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(source='RCAP', desc='building recovered images', current=0, total=n))
+
+        # Build recovered stacks for all images — still per-image because each image has its
+        # own saliency distribution, but _build_recovered_image is fully vectorized internally
+        recovered_stacks: list[torch.Tensor] = []
+        heat_means: list[torch.Tensor] = []
+        heat_sums: list[torch.Tensor] = []
+        for i in tqdm(range(n), desc='RCAP: building recovered images', disable=not self.tqdm_verbose):
             recovered_stack, stage_heat_mean, stage_heat_sum = self._build_recovered_image(
-                img, saliency_map)
-            recovered_imgs.append(recovered_stack.cpu().detach().numpy())
-            local_heat_mean.append(stage_heat_mean)
-            local_heat_sum.append(stage_heat_sum)
-            # n_bins = N_stages + 1 (the +1 is the full original image appended below)
-            n_bins = recovered_stack.shape[0] + 1
-            recovered_stack = torch.vstack(
-                [recovered_stack, img.reshape(1, *img.shape)])
-            if self.debug:
-                plotting_utils.plot_hor([np.transpose(stage.cpu().detach().numpy(), (1, 2, 0))
-                                         for stage in recovered_stack])
-            all_inputs_batch.append(recovered_stack)
+                original_images[i], saliency_maps[i])
+            recovered_stacks.append(recovered_stack)
+            heat_means.append(stage_heat_mean)
+            heat_sums.append(stage_heat_sum)
+            if self.on_progress is not None:
+                self.on_progress(XAIProgress(source='RCAP', desc='building recovered images', current=i + 1, total=n))
+
+        n_stages = recovered_stacks[0].shape[0]
+        n_bins = n_stages + 1  # stages + full original
+
+        # Append full original to each stack, then flatten into one batch — (n*n_bins, C, H, W)
+        # original_images: (n, C, H, W) → unsqueeze(1) → cat with stacks along dim=1
+        all_recovered = torch.stack(recovered_stacks, dim=0)        # (n, n_stages, C, H, W)
+        all_inputs = torch.cat(
+            [all_recovered, original_images.unsqueeze(1)], dim=1,   # (n, n_bins, C, H, W)
+        ).flatten(0, 1)                                              # (n*n_bins, C, H, W)
+
+        if self.debug:
+            for i in range(n):
+                plotting_utils.plot_hor([
+                    all_inputs[i * n_bins + s].cpu().detach().permute(1, 2, 0).numpy()
+                    for s in range(n_bins)
+                ])
 
         # Stack all images into one batch and re-normalize for model inference
-        all_inputs_batch_tensor = torch.vstack(all_inputs_batch).to(device)
-        all_inputs_batch_tensor = data_utils.normalize(all_inputs_batch_tensor)
+        all_inputs_batch_tensor = data_utils.normalize(all_inputs.to(device))
 
-        local_heat_mean_t = torch.tensor(local_heat_mean, device=device)
-        local_heat_sum_t = torch.tensor(local_heat_sum, device=device)
+        local_heat_mean_t = torch.stack(heat_means).to(device)   # (n, n_stages)
+        local_heat_sum_t  = torch.stack(heat_sums).to(device)    # (n, n_stages)
         overall_heat_mean = saliency_maps.mean(dim=(1, 2))
         overall_heat_sum = saliency_maps.sum(dim=(1, 2))
 
@@ -387,17 +384,17 @@ class RCAP(Metric):
             recovered_pred_prob_full = softmax_probs[:, :-1, :]
 
         return (
-            original_pred_score.cpu().detach().numpy(),
-            recovered_pred_score.cpu().detach().numpy(),
-            original_pred_prob.cpu().detach().numpy(),
-            recovered_pred_prob.cpu().detach().numpy(),
-            local_heat_mean_t.cpu().detach().numpy(),
-            local_heat_sum_t.cpu().detach().numpy(),
-            overall_heat_mean.cpu().detach().numpy(),
-            overall_heat_sum.cpu().detach().numpy(),
-            original_pred_prob_full.cpu().detach().numpy(),
-            recovered_pred_prob_full.cpu().detach().numpy(),
-            np.array(recovered_imgs),
+            original_pred_score.cpu().detach(),
+            recovered_pred_score.cpu().detach(),
+            original_pred_prob.cpu().detach(),
+            recovered_pred_prob.cpu().detach(),
+            local_heat_mean_t.cpu().detach(),
+            local_heat_sum_t.cpu().detach(),
+            overall_heat_mean.cpu().detach(),
+            overall_heat_sum.cpu().detach(),
+            original_pred_prob_full.cpu().detach(),
+            recovered_pred_prob_full.cpu().detach(),
+            torch.stack(recovered_stacks) if self.debug else torch.empty(0),
         )
 
 
@@ -412,11 +409,13 @@ def batch_rcap(
     lower_bound: float = 0.7,
     recover_interval: float = 0.3,
     debug: bool = False,
-) -> dict[str, np.ndarray]:
+    tqdm_verbose: bool = False,
+    on_progress: callable = None,
+) -> dict[str, torch.Tensor | dict]:
     """Convenience wrapper around RCAP.evaluate(). See RCAP for full documentation."""
-    return RCAP(lower_bound, recover_interval, debug).evaluate(model, batch, saliency_maps)
+    return RCAP(lower_bound, recover_interval, debug, tqdm_verbose, on_progress).evaluate(model, batch, saliency_maps)
 
 
-def get_rcap_score(recovered_pred: tuple, debug: bool = False) -> dict[str, np.ndarray]:
+def get_rcap_score(recovered_pred: tuple, debug: bool = False) -> dict[str, torch.Tensor]:
     """Convenience wrapper around RCAP.compute_score(). See RCAP for full documentation."""
     return RCAP.compute_score(recovered_pred, debug)

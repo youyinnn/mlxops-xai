@@ -11,3 +11,4 @@ from mlxops_xai.rcap import (
     batch_rcap,
     get_rcap_score,
 )
+from mlxops_xai.progress import XAIProgress, XAIMetric

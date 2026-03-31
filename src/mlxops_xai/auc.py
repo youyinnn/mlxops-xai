@@ -2,7 +2,6 @@
 # (allows `list[float] | None` syntax without importing from typing)
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,11 +9,11 @@ from torchvision.transforms import v2
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn import metrics
 from tqdm import tqdm
-from torchmetrics import Metric
 from mlxops_utils import plot_hor, clp
+from mlxops_xai.progress import XAIProgress, XAIMetric
 
 
-class AUC(Metric):
+class AUC(XAIMetric):
     """
     Deletion/Insertion AUC evaluator for XAI saliency maps.
 
@@ -41,6 +40,8 @@ class AUC(Metric):
         sigma: Gaussian blur kernel sigma used for insertion background (default 16).
         batch_size: Batch size for model inference (default 128).
         debug: If True, visualize deletion/insertion images and print probabilities.
+        tqdm_verbose: If True, show internal tqdm progress bars.
+        on_progress: Optional callable(XAIProgress) invoked on each sample processed.
         kwargs: Passed to torchmetrics.Metric (e.g. compute_on_cpu, dist_sync_on_step).
     """
 
@@ -53,15 +54,16 @@ class AUC(Metric):
         sigma: int = 16,
         batch_size: int = 128,
         debug: bool = False,
+        tqdm_verbose: bool = False,
+        on_progress: callable = None,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(debug=debug, tqdm_verbose=tqdm_verbose, on_progress=on_progress, **kwargs)
         self.percentages = percentages or [1, 0.8, 0.6, 0.4, 0.2]
         self.sigma = sigma
         self.batch_size = batch_size
-        self.debug = debug
-        self._delete_percentage = self.percentages
-        self._insert_percentage = np.flip(self.percentages)
+        self._delete_percentage = torch.tensor(self.percentages)
+        self._insert_percentage = self._delete_percentage.flip(0)
 
         self.add_state('d_probs', default=[], dist_reduce_fx='cat')
         self.add_state('i_probs', default=[], dist_reduce_fx='cat')
@@ -140,12 +142,12 @@ class AUC(Metric):
             d_pred_prob = self._get_pred(
                 model,
                 DataLoader(TensorDataset(all_deleted), batch_size=self.batch_size, shuffle=False),
-                device, targets, n, num_aug,
+                device, targets, n, num_aug, 'deletion',
             )
             i_pred_prob = self._get_pred(
                 model,
                 DataLoader(TensorDataset(all_inserted), batch_size=self.batch_size, shuffle=False),
-                device, targets, n, num_aug,
+                device, targets, n, num_aug, 'insertion',
             )
 
         if self.debug:
@@ -169,8 +171,8 @@ class AUC(Metric):
         Returns:
             Dict with DAUC, IAUC, AUC_Percentage, DAUC_arr, IAUC_arr.
         """
-        dauc = metrics.auc(np.flip(self._delete_percentage), d_pred_prob.mean(0))
-        iauc = metrics.auc(self._insert_percentage, i_pred_prob.mean(0))
+        dauc = metrics.auc(self._delete_percentage.flip(0).numpy(), d_pred_prob.mean(0).numpy())
+        iauc = metrics.auc(self._insert_percentage.numpy(), i_pred_prob.mean(0).numpy())
         return {
             'DAUC': dauc,
             'IAUC': iauc,
@@ -184,62 +186,91 @@ class AUC(Metric):
         original_images: torch.Tensor,
         saliency_maps: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        all_deleted = []
-        all_inserted = []
+        n = len(original_images)
+        device = original_images.device
         blurrer = v2.GaussianBlur(kernel_size=self.sigma * 2 + 1, sigma=self.sigma)
 
-        for i in tqdm(range(len(original_images)), desc='AUC: building variants'):
-            image = original_images[i]
-            saliency_map = saliency_maps[i]
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(source='AUC', desc='blurring', current=0, total=n))
 
-            delete_quantiles = self._get_quantiles(saliency_map, self._delete_percentage)
-            insert_quantiles = self._get_quantiles(saliency_map, self._insert_percentage, remove_head=False)
+        blurred = blurrer(original_images).unsqueeze(1)
 
-            deleted = [torch.where(saliency_map > q, 0, image) for q in np.flip(delete_quantiles)]
-            blurred = blurrer(image)
-            inserted = [torch.where(saliency_map > q, image, blurred) for q in insert_quantiles]
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(source='AUC', desc='building variants', current=0, total=n))
 
-            if self.debug:
-                plot_hor([clp(k.cpu()) for k in deleted])
-                plot_hor([clp(k.cpu()) for k in inserted])
+        # Compute per-image quantile thresholds for all images at once
+        sorted_sal, _ = torch.sort(saliency_maps.flatten(1), dim=1)  # (N, H*W)
+        num_pixels = sorted_sal.shape[1]
+        d_idx = torch.clamp((self._delete_percentage.to(device) * num_pixels).long() - 1, min=0)  # (num_steps,)
+        i_idx = torch.clamp((self._insert_percentage.to(device) * num_pixels).long() - 1, min=0)
 
-            all_deleted.extend(deleted)
-            all_inserted.extend(inserted)
+        # (N, num_steps); deletion needs low→high order (flip), insertion is already low→high
+        d_thresholds = sorted_sal[:, d_idx].flip(1)  # (N, num_steps)
+        i_thresholds = sorted_sal[:, i_idx]           # (N, num_steps)
 
-        return torch.stack(all_deleted), torch.stack(all_inserted)
+        # Vectorized mask + image generation: (N, num_steps, H, W)
+        sal = saliency_maps.unsqueeze(1)              # (N, 1, H, W)
+        img = original_images.unsqueeze(1)            # (N, 1, C, H, W)
 
-    @staticmethod
+        d_masks = sal > d_thresholds.view(n, -1, 1, 1)  # (N, num_steps, H, W)
+        i_masks = sal > i_thresholds.view(n, -1, 1, 1)
+
+        all_deleted = torch.where(d_masks.unsqueeze(2), torch.zeros_like(img), img)   # (N, num_steps, C, H, W)
+        all_inserted = torch.where(i_masks.unsqueeze(2), img, blurred)
+
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(source='AUC', desc='building variants', current=n, total=n))
+
+        if self.debug:
+            num_steps = len(self._delete_percentage)
+            for i in range(n):
+                plot_hor([clp(all_deleted[i, s].cpu()) for s in range(num_steps)])
+                plot_hor([clp(all_inserted[i, s].cpu()) for s in range(num_steps)])
+
+        # flatten to (N*num_steps, C, H, W) for DataLoader
+        return all_deleted.flatten(0, 1), all_inserted.flatten(0, 1)
+
     def _get_pred(
+        self,
         model: nn.Module,
         dataloader: DataLoader,
         device: torch.device,
         targets: torch.Tensor,
         n: int,
         num_aug: int,
+        phase: str = 'inference',
     ) -> torch.Tensor:
-        prediction = []
-        for d in tqdm(dataloader, desc='AUC: model inference'):
-            prediction.extend(model(d[0].to(device)))
+        batches = []
+        total_batches = len(dataloader)
+        desc = f'AUC: {phase} inference'
+        for batch_idx, d in enumerate(tqdm(dataloader, desc=desc, disable=not self.tqdm_verbose)):
+            batches.append(model(d[0].to(device)))
+            if self.on_progress is not None:
+                self.on_progress(XAIProgress(
+                    source='AUC',
+                    desc=f'{phase} inference',
+                    current=batch_idx + 1,
+                    total=total_batches,
+                ))
 
-        prediction = torch.stack(prediction).to(device)
+        prediction = torch.cat(batches, dim=0)  # (N*num_aug, num_classes)
         num_classes = prediction.shape[1]
         prediction = prediction.reshape(n, num_aug, num_classes)
-        sm = F.softmax(prediction, dim=2)
-        pred_prob = []
-        for i, smm in enumerate(sm):
-            pred_prob.extend(smm[:, targets[i]])
-        return torch.tensor(pred_prob, device=device).reshape(n, num_aug)
+        sm = F.softmax(prediction, dim=2)       # (n, num_aug, num_classes)
+        # gather target-class prob for each image — no Python loop
+        targets_exp = targets.to(device)[:, None, None].expand(n, num_aug, 1)
+        return sm.gather(2, targets_exp).squeeze(2).cpu()  # (n, num_aug)
 
     @staticmethod
     def _get_quantiles(
         saliency_map: torch.Tensor,
-        percentage: list[float],
+        percentage: torch.Tensor,
         remove_head: bool = False,
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
         v, _ = torch.sort(saliency_map.flatten())
-        q_idx = [max(int(v.shape[0] * rate) - 1, 0) for rate in percentage]
-        q = np.flip(np.array([v[i].item() for i in q_idx]))
-        if remove_head and (len(q) == len(set(q))) and (len(q) > 1):
+        q_idx = torch.clamp((percentage * v.shape[0]).long() - 1, min=0)
+        q = v[q_idx].flip(0)
+        if remove_head and (len(q) == len(q.unique())) and (len(q) > 1):
             if q[0] == 1:
                 q = q[1:]
         return q
@@ -255,9 +286,11 @@ def get_auc_input(
     saliency_maps: torch.Tensor,
     sigma: int | None = None,
     debug: bool = False,
+    tqdm_verbose: bool = False,
+    on_progress: callable = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience wrapper around AUC.get_input(). See AUC for full documentation."""
-    return AUC(sigma=sigma or 16, debug=debug).get_input(model, batch, saliency_maps)
+    return AUC(sigma=sigma or 16, debug=debug, tqdm_verbose=tqdm_verbose, on_progress=on_progress).get_input(model, batch, saliency_maps)
 
 
 def get_auc_score(
