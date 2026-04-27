@@ -60,7 +60,8 @@ class RCAP(XAIMetric):
         on_progress: callable = None,
         **kwargs,
     ) -> None:
-        super().__init__(debug=debug, tqdm_verbose=tqdm_verbose, on_progress=on_progress, **kwargs)
+        super().__init__(debug=debug, tqdm_verbose=tqdm_verbose,
+                         on_progress=on_progress, **kwargs)
         self.lower_bound = lower_bound
         self.recover_interval = recover_interval
 
@@ -121,15 +122,15 @@ class RCAP(XAIMetric):
         def _cat(tensors: list[torch.Tensor]) -> torch.Tensor:
             return torch.cat(tensors, dim=0).cpu()
 
-        original_pred_score   = _cat(self.original_pred_score)
-        recovered_pred_score  = _cat(self.recovered_pred_score)
-        original_pred_prob    = _cat(self.original_pred_prob)
-        recovered_pred_prob   = _cat(self.recovered_pred_prob)
-        local_heat_mean       = _cat(self.local_heat_mean)
-        local_heat_sum        = _cat(self.local_heat_sum)
-        overall_heat_mean     = _cat(self.overall_heat_mean)
-        overall_heat_sum      = _cat(self.overall_heat_sum)
-        original_pred_prob_full  = _cat(self.all_original_pred_prob_full)
+        original_pred_score = _cat(self.original_pred_score)
+        recovered_pred_score = _cat(self.recovered_pred_score)
+        original_pred_prob = _cat(self.original_pred_prob)
+        recovered_pred_prob = _cat(self.recovered_pred_prob)
+        local_heat_mean = _cat(self.local_heat_mean)
+        local_heat_sum = _cat(self.local_heat_sum)
+        overall_heat_mean = _cat(self.overall_heat_mean)
+        overall_heat_sum = _cat(self.overall_heat_sum)
+        original_pred_prob_full = _cat(self.all_original_pred_prob_full)
         recovered_pred_prob_full = _cat(self.all_recovered_pred_prob_full)
 
         score_inputs = (
@@ -206,7 +207,8 @@ class RCAP(XAIMetric):
 
         # visual_noise_level[i, k] = local_heat_sum[i, k] / overall_heat_sum[i]
         # overall_heat_sum[:, None] broadcasts (n,) → (n, 1) so each row divides by its own total
-        visual_noise_level: torch.Tensor = local_heat_sum / overall_heat_sum[:, None]
+        visual_noise_level: torch.Tensor = local_heat_sum / \
+            overall_heat_sum[:, None]
 
         rcap_with_heat_weight: torch.Tensor = \
             (local_heat_mean * visual_noise_level * recovered_pred_prob).mean(-1)
@@ -261,15 +263,18 @@ class RCAP(XAIMetric):
             self.lower_bound, 0.999999, self.recover_interval,
             device=saliency_map.device,
         )
-        quantile_idx = torch.clamp((quantile_vals * num_pixels).long() - 1, min=0)
+        quantile_idx = torch.clamp(
+            (quantile_vals * num_pixels).long() - 1, min=0)
         # flip to high→low order so we reveal most-salient regions first
-        quantile_thresholds = sorted_saliency[quantile_idx].flip(0)  # (n_stages,)
+        quantile_thresholds = sorted_saliency[quantile_idx].flip(
+            0)  # (n_stages,)
 
         # Vectorized: build all cumulative masks at once — (n_stages, H, W)
         # stage k reveals all pixels with saliency > thresholds[k]
         thresholds_clamped = torch.where(
             quantile_thresholds < 1.0, quantile_thresholds, torch.zeros_like(quantile_thresholds))
-        cumulative_masks = saliency_map.unsqueeze(0) > thresholds_clamped.view(-1, 1, 1)
+        cumulative_masks = saliency_map.unsqueeze(
+            0) > thresholds_clamped.view(-1, 1, 1)
 
         # Build all recovered images in one broadcast where — (n_stages, C, H, W)
         recovered_stack = torch.where(
@@ -280,9 +285,12 @@ class RCAP(XAIMetric):
 
         # Cumulative saliency stats: sum/mean over revealed pixels per stage
         cumulative_masks_f = cumulative_masks.float()
-        masked_sal = saliency_map.unsqueeze(0) * cumulative_masks_f          # (n_stages, H, W)
-        n_revealed = cumulative_masks_f.sum(dim=(1, 2))                       # (n_stages,)
-        local_heat_sum_t = masked_sal.sum(dim=(1, 2))                         # (n_stages,)
+        masked_sal = saliency_map.unsqueeze(
+            0) * cumulative_masks_f          # (n_stages, H, W)
+        n_revealed = cumulative_masks_f.sum(
+            dim=(1, 2))                       # (n_stages,)
+        local_heat_sum_t = masked_sal.sum(
+            dim=(1, 2))                         # (n_stages,)
         local_heat_mean_t = local_heat_sum_t / n_revealed.clamp(min=1)
 
         return recovered_stack, local_heat_mean_t, local_heat_sum_t
@@ -313,10 +321,15 @@ class RCAP(XAIMetric):
             with torch.no_grad():
                 targets = torch.argmax(model(original_images), dim=1)
 
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='denormalizing images', current=0, total=1))
+
         original_images = data_utils.denormalize(original_images)
 
         if self.on_progress is not None:
-            self.on_progress(XAIProgress(source='RCAP', desc='building recovered images', current=0, total=n))
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='building recovered images', current=0, total=n))
 
         # Build recovered stacks for all images — still per-image because each image has its
         # own saliency distribution, but _build_recovered_image is fully vectorized internally
@@ -330,34 +343,51 @@ class RCAP(XAIMetric):
             heat_means.append(stage_heat_mean)
             heat_sums.append(stage_heat_sum)
             if self.on_progress is not None:
-                self.on_progress(XAIProgress(source='RCAP', desc='building recovered images', current=i + 1, total=n))
+                self.on_progress(XAIProgress(
+                    source='RCAP', desc='building recovered images', current=i + 1, total=n))
 
         n_stages = recovered_stacks[0].shape[0]
         n_bins = n_stages + 1  # stages + full original
 
         # Append full original to each stack, then flatten into one batch — (n*n_bins, C, H, W)
         # original_images: (n, C, H, W) → unsqueeze(1) → cat with stacks along dim=1
-        all_recovered = torch.stack(recovered_stacks, dim=0)        # (n, n_stages, C, H, W)
+        # (n, n_stages, C, H, W)
+        all_recovered = torch.stack(recovered_stacks, dim=0)
         all_inputs = torch.cat(
-            [all_recovered, original_images.unsqueeze(1)], dim=1,   # (n, n_bins, C, H, W)
+            # (n, n_bins, C, H, W)
+            [all_recovered, original_images.unsqueeze(1)], dim=1,
         ).flatten(0, 1)                                              # (n*n_bins, C, H, W)
 
         if self.debug:
             for i in range(n):
                 plotting_utils.plot_hor([
-                    all_inputs[i * n_bins + s].cpu().detach().permute(1, 2, 0).numpy()
+                    all_inputs[i * n_bins +
+                               s].cpu().detach().permute(1, 2, 0).numpy()
                     for s in range(n_bins)
                 ])
 
         # Stack all images into one batch and re-normalize for model inference
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='normalizing for inference', current=0, total=1))
+
         all_inputs_batch_tensor = data_utils.normalize(all_inputs.to(device))
 
-        local_heat_mean_t = torch.stack(heat_means).to(device)   # (n, n_stages)
-        local_heat_sum_t  = torch.stack(heat_sums).to(device)    # (n, n_stages)
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='normalizing for inference', current=1, total=1))
+
+        local_heat_mean_t = torch.stack(
+            heat_means).to(device)   # (n, n_stages)
+        local_heat_sum_t = torch.stack(heat_sums).to(device)    # (n, n_stages)
         overall_heat_mean = saliency_maps.mean(dim=(1, 2))
         overall_heat_sum = saliency_maps.sum(dim=(1, 2))
 
         # Run all recovered + original images through the model in one forward pass
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='model inference', current=0, total=1))
+
         with torch.no_grad():
             prediction = model(all_inputs_batch_tensor)
             # Reshape to (n, n_bins, num_classes) for per-image indexing
@@ -382,6 +412,10 @@ class RCAP(XAIMetric):
             # full softmax dist on original / recovered
             original_pred_prob_full = softmax_probs[:, -1:, :]
             recovered_pred_prob_full = softmax_probs[:, :-1, :]
+
+        if self.on_progress is not None:
+            self.on_progress(XAIProgress(
+                source='RCAP', desc='model inference', current=1, total=1))
 
         return (
             original_pred_score.cpu().detach(),
