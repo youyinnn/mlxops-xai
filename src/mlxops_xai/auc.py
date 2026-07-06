@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import v2
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn import metrics
 from tqdm import tqdm
 from mlxops_utils import plot_hor, clp
 from mlxops_xai.progress import XAIProgress, XAIMetric
@@ -169,16 +168,32 @@ class AUC(XAIMetric):
             i_pred_prob: Insertion probabilities (N, num_steps).
 
         Returns:
-            Dict with DAUC, IAUC, AUC_Percentage, DAUC_arr, IAUC_arr.
+            Dict with DAUC, IAUC, AUC_Percentage, DAUC_arr, IAUC_arr,
+            DAUC_per_sample, IAUC_per_sample.
         """
-        dauc = metrics.auc(self._delete_percentage.flip(0).numpy(), d_pred_prob.mean(0).numpy())
-        iauc = metrics.auc(self._insert_percentage.numpy(), i_pred_prob.mean(0).numpy())
+        # Integration x-axes (ascending). Insertion probs are already stored
+        # low→high retention; deletion probs are stored high→low, so flip both
+        # the x-axis and the y-values into ascending order before integrating.
+        d_x = self._delete_percentage.flip(0)  # (num_steps,) ascending
+        i_x = self._insert_percentage           # (num_steps,) ascending
+
+        # Per-sample AUC via the trapezoidal rule — same integration sklearn.metrics.auc
+        # uses, but vectorized over rows so each sample gets its own score.
+        dauc_per_sample = torch.trapezoid(d_pred_prob.flip(1), x=d_x, dim=1)  # (N,)
+        iauc_per_sample = torch.trapezoid(i_pred_prob, x=i_x, dim=1)          # (N,)
+
+        # Dataset-level scalars: mean over samples. Trapezoid is linear in y, so
+        # this equals auc(x, probs.mean(0)) — the previous behaviour, preserved.
+        dauc = dauc_per_sample.mean().item()
+        iauc = iauc_per_sample.mean().item()
         return {
             'DAUC': dauc,
             'IAUC': iauc,
             'AUC_Percentage': self._insert_percentage,
             'DAUC_arr': d_pred_prob,
             'IAUC_arr': i_pred_prob,
+            'DAUC_per_sample': dauc_per_sample,
+            'IAUC_per_sample': iauc_per_sample,
         }
 
     def _build_variants(
