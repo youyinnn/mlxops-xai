@@ -141,6 +141,11 @@ class RCAP(XAIMetric):
             None,
         )
 
+        overall_rcap = self.compute_score(score_inputs)
+        rcap_per_sampele = {
+            k: v.mean(dim=1) if v.dim() > 1 else v for k, v in overall_rcap.items()
+        }
+
         return {
             'original_pred_score':          original_pred_score,
             'recovered_pred_score':         recovered_pred_score,
@@ -152,7 +157,8 @@ class RCAP(XAIMetric):
             'overall_heat_sum':             overall_heat_sum,
             'all_original_pred_prob_full':  original_pred_prob_full,
             'all_recovered_pred_prob_full': recovered_pred_prob_full,
-            'overall_rcap':                 self._compute_rcap_score(score_inputs),
+            'overall_rcap':                 overall_rcap,
+            'rcap_per_sample':              rcap_per_sampele,
         }
 
     def evaluate(
@@ -230,9 +236,6 @@ class RCAP(XAIMetric):
             'localization':       recovered_pred_prob,
             'RCAP':               rcap_score,
         }
-
-    def _compute_rcap_score(self, recovered_pred: tuple) -> dict[str, torch.Tensor]:
-        return self.compute_score(recovered_pred, debug=self.debug)
 
     def _build_recovered_image(
         self,
