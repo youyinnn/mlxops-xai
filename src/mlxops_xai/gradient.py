@@ -469,7 +469,15 @@ def guided_ig_impl(
         gamma = torch.inf
 
         st2 = time.time()
+        # Defensive cap only: the inner loop normally converges in ~2
+        # iterations. This guards against a pathological spin without
+        # changing results on the normal path.
+        max_inner = x.numel()
+        inner = 0
         while gamma > 1.0:
+            inner += 1
+            if inner > max_inner:
+                break
             x_old = x.clone()
             x_alpha = translate_x_to_alpha(x, images, x_baseline)
             x_alpha[torch.isnan(x_alpha)] = alpha_max
@@ -521,6 +529,146 @@ def guided_ig_impl(
     return attr
 
 
+def _direction_transform(rs, ifabs, direction):
+    if ifabs or direction == "abs":
+        return rs.abs()
+    if direction == "both":
+        return rs
+    if direction == "positive":
+        return torch.clamp(rs, min=0)
+    if direction == "negative":
+        return torch.clamp(rs, max=0)
+    return rs
+
+
+def guided_ig_impl_batch(
+    model,
+    images: torch.Tensor,
+    targets,
+    x_baseline=None,
+    loss=False,
+    steps=10,
+    fraction=0.25,
+    ifabs=False,
+    direction="both",
+    max_dist=0.02,
+    **kwargs
+):
+    """Batched Guided IG that reproduces guided_ig_impl exactly.
+
+    One backward pass per step over the whole (N, C, W, H) batch instead of
+    one image at a time. Every per-image quantity (l1 targets, quantile
+    threshold, gamma, and the three loop-exit conditions) is tracked along
+    the batch dimension so each image follows the identical trajectory it
+    would under the scalar reference implementation. Converged images freeze
+    (their x stops changing) and therefore contribute zero to later
+    iterations, which is a no-op for sum/mean aggregation.
+
+    Returns a list of (N, C, W, H) tensors, one per inner iteration.
+    """
+    EPSILON = 1e-9
+    n = images.shape[0]
+    if x_baseline is None:
+        x_baseline = torch.zeros_like(images)
+    x = x_baseline.clone()
+    l1_total = torch.abs(images - x_baseline).sum(
+        dim=(1, 2, 3), keepdim=True)  # (N,1,1,1)
+
+    attr = []
+    # Images whose baseline already equals the input never move.
+    trivial = torch.abs(images - x_baseline).sum(dim=(1, 2, 3)) == 0  # (N,)
+
+    def per_image_l1(a, b):
+        return torch.abs(a - b).sum(dim=(1, 2, 3), keepdim=True)  # (N,1,1,1)
+
+    for step in range(steps):
+        grad_actual = get_gradients(model, x, targets, loss=loss, **kwargs)
+        grad = grad_actual.clone()
+
+        alpha = (step + 1.0) / steps
+        alpha_min = max(alpha - max_dist, 0.0)
+        alpha_max = min(alpha + max_dist, 1.0)
+        x_min = translate_alpha_to_x(alpha_min, images, x_baseline)
+        x_max = translate_alpha_to_x(alpha_max, images, x_baseline)
+        l1_target = l1_total * (1 - (step + 1) / steps)  # (N,1,1,1)
+
+        # Per-step convergence flag per image; resets each step (mirrors
+        # gamma = inf at the top of each scalar step).
+        step_done = trivial.clone()  # (N,)
+        max_inner = images[0].numel()
+        inner = 0
+        while not bool(step_done.all()):
+            inner += 1
+            if inner > max_inner:
+                break
+
+            x_old = x.clone()
+            x_alpha = translate_x_to_alpha(x, images, x_baseline)
+            x_alpha[torch.isnan(x_alpha)] = alpha_max
+            x = torch.where(x_alpha < alpha_min, x_min, x)
+
+            l1_current = per_image_l1(x, images)  # (N,1,1,1)
+
+            # --- exit case 1: reached the l1 target (isclose) ---
+            reached = torch.isclose(
+                l1_target, l1_current, rtol=EPSILON, atol=EPSILON
+            ).reshape(n)  # (N,)
+
+            grad = torch.where(x == x_max, torch.inf, grad)
+            abs_grad = torch.abs(grad)
+            threshold = torch.quantile(
+                abs_grad.reshape(n, -1), fraction, dim=1,
+                interpolation="lower"
+            ).reshape(n, 1, 1, 1)  # (N,1,1,1)
+            s = torch.logical_and(abs_grad <= threshold, grad != torch.inf)
+
+            l1_s = (torch.abs(x - x_max) * s).sum(
+                dim=(1, 2, 3), keepdim=True)  # (N,1,1,1)
+
+            # --- exit case 2: no candidates (l1_s <= 0) ---
+            stalled = (l1_s.reshape(n) <= 0)  # (N,)
+
+            gamma = torch.where(
+                l1_s > 0, (l1_current - l1_target) / l1_s,
+                torch.full_like(l1_s, torch.inf),
+            )  # (N,1,1,1)
+            gamma_le1 = (gamma <= 1.0).reshape(n)  # (N,) -> exit case 3
+
+            # x update for images that move this iteration (not reached,
+            # not stalled): jump to x_max if gamma>1 else partial step.
+            x_jump = torch.where(s, x_max, x)
+            x_partial = torch.where(
+                s, translate_alpha_to_x_batch(gamma, x_max, x), x)
+            x_moved = torch.where((gamma > 1.0), x_jump, x_partial)
+
+            moving = (~step_done) & (~reached) & (~stalled)  # (N,)
+            x = torch.where(moving.reshape(n, 1, 1, 1), x_moved, x)
+
+            # rs per image. Case 1 (reached) appends (x - x_old)*grad_actual
+            # WITHOUT the direction transform; moving images (case 3 and the
+            # continue branch) append it WITH the transform; stalled and
+            # already-done images append nothing (zeros).
+            rs_raw = (x - x_old) * grad_actual
+            rs_dir = _direction_transform(rs_raw, ifabs, direction)
+
+            reached_active = reached & (~step_done)  # (N,)
+            rs = torch.zeros_like(rs_raw)
+            rs = torch.where(reached_active.reshape(n, 1, 1, 1), rs_raw, rs)
+            rs = torch.where(moving.reshape(n, 1, 1, 1), rs_dir, rs)
+            attr.append(rs)
+
+            # Update per-step done: case1 reached, case2 stalled, case3
+            # gamma<=1 (moved once then would exit next while-check).
+            step_done = step_done | reached | stalled | (moving & gamma_le1)
+
+    return attr
+
+
+def translate_alpha_to_x_batch(alpha, x_input, x_baseline):
+    """Batched translate_alpha_to_x; alpha is a per-image (N,1,1,1) tensor."""
+    return x_baseline + (x_input - x_baseline) * alpha
+
+
 def guided_ig(
     model,
     images,
@@ -534,11 +682,34 @@ def guided_ig(
     ifabs=False,
     aggregation="mean",
     th=0,
+    batched=True,
     **kwargs
 ):
 
     if targets is None:
         targets = torch.argmax(model(images), dim=1)
+
+    # The batched path is exact only for the additive (mean) aggregation:
+    # zero-padding converged images is a no-op for a sum but not for the
+    # variance used by the "guided"/"variance" modes. Fall back otherwise.
+    if batched and aggregation == "mean":
+        attr = guided_ig_impl_batch(
+            model,
+            images,
+            targets,
+            None,
+            loss=loss,
+            steps=num_samples,
+            fraction=fraction,
+            direction=direction,
+            max_dist=max_dist,
+            ifabs=ifabs,
+            **kwargs
+        )
+        # attr: list of (N, C, W, H); aggregate over the list per image.
+        return aggregate_saliency_maps(
+            attr, ifabs=ifabs, th=th, aggregation=aggregation
+        )
 
     us = []
     for i, image in enumerate(images):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mlxops-xai"
-version = "0.3.0"
+version = "0.4.0"
 description = "XAI (Explainable AI) methods including gradient-based saliency and RCAP"
 readme = "README.md"
 requires-python = ">=3.11.4"
@@ -31,3 +31,7 @@ packages = ["src/mlxops_xai"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
